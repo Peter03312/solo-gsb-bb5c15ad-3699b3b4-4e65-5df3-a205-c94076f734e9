@@ -5,8 +5,9 @@
 """
 from datetime import datetime, timedelta, timezone
 
+from .certificates import register_certificate
 from .db import db_session, init_db
-from .schemas import EventIn, SampleIn, TempConfigIn, TempReadingIn
+from .schemas import EventIn, SampleIn, TempCertIn, TempConfigIn, TempReadingIn
 from .service import create_event, register_sample
 from .temperature import create_temp_reading, set_temp_config
 
@@ -66,6 +67,7 @@ def seed_demo() -> dict[str, int]:
     inserted_events = 0
     inserted_configs = 0
     inserted_readings = 0
+    inserted_certs = 0
     with db_session(immediate=True) as conn:
         for s in samples:
             _, idempotent = register_sample(conn, s)
@@ -98,12 +100,22 @@ def seed_demo() -> dict[str, int]:
             _, idempotent = create_temp_reading(conn, rd)
             inserted_readings += int(not idempotent)
 
+        # 测温设备校准证明演示：DEV-COLD-01 覆盖运输时段的有效证明
+        # （可信复核据此判定有证读数；证明可晚于运输记录补齐，此处随演示一并写入）
+        _, idempotent = register_certificate(conn, TempCertIn(
+            cert_id="DEMO-CERT-01", device_id="DEV-COLD-01",
+            valid_from=_iso(t0 - timedelta(hours=4)), valid_until=_iso(t0),
+            issuer="省计量院"))
+        inserted_certs += int(not idempotent)
+
     print(f"[seed] 样本新增 {inserted_samples} 条，事件新增 {inserted_events} 条，"
-          f"测温配置新增 {inserted_configs} 条，测温读数新增 {inserted_readings} 条")
+          f"测温配置新增 {inserted_configs} 条，测温读数新增 {inserted_readings} 条，"
+          f"校准证明新增 {inserted_certs} 条")
     if inserted_samples:
         print("[seed] 演示编号: DEMO-VALID-001(有效) / DEMO-PENDING-002(待补证，含运输测温演示) / DEMO-INVALID-003(无效)")
     return {"samples": inserted_samples, "events": inserted_events,
-            "temp_configs": inserted_configs, "temp_readings": inserted_readings}
+            "temp_configs": inserted_configs, "temp_readings": inserted_readings,
+            "temp_certs": inserted_certs}
 
 
 if __name__ == "__main__":

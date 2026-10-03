@@ -1,5 +1,5 @@
 """HTTP 请求体的 Pydantic 模型与按事件类型的必填字段校验。"""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -354,3 +354,51 @@ class TempReadingIn(BaseModel):
     device_id: str = Field(..., min_length=1, description="测温设备号")
     occurred_at: datetime = Field(..., description="读数发生时间 ISO8601（不得早于采集时间）")
     value_celsius: float = Field(..., allow_inf_nan=False, description="摄氏温度读数（有限数值）")
+
+
+class TempCertIn(BaseModel):
+    """测温设备校准证明登记：全局唯一证明号 + 设备号 + 有效起止时刻 + 签发人。
+
+    * 证明有效期为左闭右开区间 [valid_from, valid_until)：valid_from 必须早于 valid_until；
+    * 同一设备的有效（未作废）证明时段不得重叠（左闭右开，端点相邻不算重叠）；
+    * 同证明号同内容重试幂等返回原记录，异内容冲突；
+    * 证明是设备维度证据：不挂接样本、不受样本核定冻结影响、不产生保管链版本。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cert_id: str = Field(..., min_length=1, description="全局唯一证明号，同号重试幂等")
+    device_id: str = Field(..., min_length=1, description="测温设备号（与读数设备号对应）")
+    valid_from: datetime = Field(..., description="有效期起始时刻 ISO8601（左闭，含该时刻）")
+    valid_until: datetime = Field(..., description="有效期截止时刻 ISO8601（右开，不含该时刻）")
+    issuer: str = Field(..., min_length=1, description="签发人")
+
+    @model_validator(mode="after")
+    def _check_period(self) -> "TempCertIn":
+        start, end = self.valid_from, self.valid_until
+        # 统一按 UTC 比较，避免 naive/aware 混比（无时区输入按 UTC 处理，与服务层一致）
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start >= end:
+            raise ValueError("证明有效期无效：valid_from 必须早于 valid_until（左闭右开区间）")
+        return self
+
+
+class TempCertVoidIn(BaseModel):
+    """按证明号作废校准证明：附作废理由。
+
+    * 作废后证明不再覆盖任何读数，也不再参与同设备时段重叠判定（时段释放可补登）；
+    * 同证明号同理由重试幂等返回原结果，异理由冲突；未知证明号拒绝且不留记录。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=1, description="作废理由（必填非空）")
+
+    @model_validator(mode="after")
+    def _check_reason(self) -> "TempCertVoidIn":
+        if not self.reason.strip():
+            raise ValueError("作废理由不得为空或纯空白")
+        return self

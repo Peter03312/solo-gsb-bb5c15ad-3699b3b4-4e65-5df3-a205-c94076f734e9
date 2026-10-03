@@ -223,12 +223,30 @@ CREATE TABLE IF NOT EXISTS temp_reading (
     UNIQUE (sample_id, occurred_at)                  -- 同一样本同一发生时刻只允许一条读数
 );
 
+-- 测温设备校准证明（设备维度，可晚于运输记录补齐）：按全局唯一证明号登记设备号、
+-- 有效起止时刻（左闭右开 [valid_from, valid_until)）与签发人；同一设备的有效
+-- （未作废）证明时段不得重叠；支持按证明号附理由作废，作废后不再覆盖读数、
+-- 不参与重叠判定。证明登记/作废不改原始读数、不产生保管链版本、不受样本核定冻结影响。
+CREATE TABLE IF NOT EXISTS temp_calibration_cert (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    cert_id       TEXT NOT NULL UNIQUE,              -- 全局唯一证明号
+    device_id     TEXT NOT NULL,                     -- 测温设备号（与读数设备号对应）
+    valid_from    TEXT NOT NULL,                     -- 有效期起始时刻（UTC ISO8601，左闭，含该时刻）
+    valid_until   TEXT NOT NULL,                     -- 有效期截止时刻（UTC ISO8601，右开，不含该时刻）
+    issuer        TEXT NOT NULL,                     -- 签发人
+    content_hash  TEXT NOT NULL,                     -- 登记内容指纹（同证明号重试比对）
+    voided_at     TEXT,                              -- 作废时间（NULL=有效）
+    void_reason   TEXT,                              -- 作废理由（作废时必填）
+    created_at    TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
 CREATE INDEX IF NOT EXISTS idx_review_case_dossier ON review_case(dossier_pk);
 CREATE INDEX IF NOT EXISTS idx_review_opinion_review ON review_opinion(review_pk, item_index);
 CREATE INDEX IF NOT EXISTS idx_person_alias_person ON person_alias(person_pk);
 CREATE INDEX IF NOT EXISTS idx_temp_reading_sample_time ON temp_reading(sample_id, occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_temp_cert_device ON temp_calibration_cert(device_id, valid_from, id);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）

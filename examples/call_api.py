@@ -738,6 +738,104 @@ def main() -> None:
             who = a.get("custodian") or (f"在途 {a.get('transfer_no')}" if a["kind"] == "in_transit" else "待核")
             print(f"  重算后段 {seg['start']} → {seg['end']} 归属: {who}")
 
+    # 18) 测温设备校准证明：登记/作废与可信复核（证明可晚于运输记录补齐）
+    print("\n=== 测温设备校准证明与可信复核 ===")
+    # 18.1) 独立样本：运输途中两台设备读数（DEV-A 含超温点，DEV-B 一条）
+    ccode = f"API-CERT-{run_id}"
+    call("POST", "/samples", {
+        "sample_code": ccode, "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector, "seal_no": "SEAL-CERT-1",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-CEVT-T1-{run_id}", "event_type": "transfer", "sample_code": ccode,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": "TR-CERT-1", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/temperature-configs", {
+        "sample_code": ccode, "min_celsius": 2.0, "max_celsius": 8.0, "max_interval_seconds": 1800,
+    })
+    for rid, dev, when, value in [
+        ("CRD-1", "DEV-A", "2026-09-30T01:30:00Z", 4.0),
+        ("CRD-2", "DEV-A", "2026-09-30T02:30:00Z", 9.6),   # 超温（在途）
+        ("CRD-3", "DEV-B", "2026-09-30T03:00:00Z", 6.0),
+    ]:
+        s, r = call("POST", "/temperature-readings", {
+            "sample_code": ccode, "reading_id": f"API-{rid}-{run_id}",
+            "device_id": dev, "occurred_at": when, "value_celsius": value,
+        })
+        print(f"  读数 {rid} {dev} {when} {value}℃ [HTTP {s}]")
+
+    # 18.2) 证明尚未补齐：可信复核明确标记无法评估，逐条给出缺证原因
+    s, r = call("GET", f"/samples/{ccode}/temperature/trusted")
+    print(f"\n--- 可信复核（证明未补齐）[HTTP {s}] ---")
+    print("可评估:", r["evaluable"], "|", r["unevaluable_reason"])
+    for x in r["readings"]:
+        print(f"  {x['reading_id']} {x['device_id']} {x['occurred_at']}"
+              f" → {x['coverage']} {x['uncovered_reason']['code'] if x['uncovered_reason'] else ''}")
+
+    # 18.3) 补录校准证明（晚于运输记录）：DEV-A 覆盖 01:00~03:00
+    s, r = call("POST", "/temperature-certificates", {
+        "cert_id": f"API-CERT-A-{run_id}", "device_id": "DEV-A",
+        "valid_from": "2026-09-30T01:00:00Z", "valid_until": "2026-09-30T03:00:00Z",
+        "issuer": "省计量院",
+    })
+    show("登记校准证明（201）", s, r, "certificate")
+    s, r = call("POST", "/temperature-certificates", {
+        "cert_id": f"API-CERT-A-{run_id}", "device_id": "DEV-A",
+        "valid_from": "2026-09-30T01:00:00Z", "valid_until": "2026-09-30T03:00:00Z",
+        "issuer": "省计量院",
+    })
+    show("同证明号同内容重试（200 幂等）", s, r, "idempotent")
+    s, r = call("POST", "/temperature-certificates", {
+        "cert_id": f"API-CERT-A-{run_id}", "device_id": "DEV-A",
+        "valid_from": "2026-09-30T01:00:00Z", "valid_until": "2026-09-30T04:00:00Z",
+        "issuer": "省计量院",
+    })
+    print("同证明号异内容:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", "/temperature-certificates", {
+        "cert_id": f"API-CERT-A2-{run_id}", "device_id": "DEV-A",
+        "valid_from": "2026-09-30T02:00:00Z", "valid_until": "2026-09-30T05:00:00Z",
+        "issuer": "省计量院",
+    })
+    print("同设备时段重叠:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", "/temperature-certificates", {
+        "cert_id": f"API-CERT-BAD-{run_id}", "device_id": "DEV-A",
+        "valid_from": "2026-09-30T05:00:00Z", "valid_until": "2026-09-30T05:00:00Z",
+        "issuer": "省计量院",
+    })
+    print("无效时段（起=止）:", s, "(422 字段校验)")
+
+    # 18.4) 补录后即时重算：有证读数参与评估，无证读数逐条标注缺证原因
+    s, r = call("GET", f"/samples/{ccode}/temperature/trusted")
+    print(f"\n--- 可信复核（DEV-A 证明已补录）[HTTP {s}] ---")
+    print("可评估:", r["evaluable"], "| 有证读数", r["trusted_reading_count"], "/", r["reading_count"])
+    for x in r["readings"]:
+        cert_id = x["certificate"]["cert_id"] if x["certificate"] else "-"
+        reason = x["uncovered_reason"]["code"] if x["uncovered_reason"] else ""
+        print(f"  {x['reading_id']} {x['device_id']} → {x['coverage']} 证明:{cert_id} {reason}")
+    for p in r["out_of_range_points"]:
+        a = p["attribution"]
+        who = a.get("custodian") or (f"在途 {a.get('transfer_no')}" if a["kind"] == "in_transit" else "待核")
+        print(f"  超温点 {p['reading_id']} {p['value_celsius']}℃ 证明:{p['cert_id']} 归属:{who}")
+    for g in r["gap_intervals"]:
+        print(f"  缺测区间 {g['before_reading_id']}→{g['after_reading_id']}"
+              f"（{g['duration_seconds']}秒，{len(g['segments'])} 段）")
+
+    # 18.5) 作废证明：附理由作废后不再覆盖读数，查询即时重算；未知证明号 404
+    s, r = call("POST", f"/temperature-certificates/API-CERT-A-{run_id}/void",
+                {"reason": "检定机构撤回原证明，待重开"})
+    show("作废证明（200）", s, r, "certificate")
+    s, r = call("POST", f"/temperature-certificates/API-CERT-A-{run_id}/void",
+                {"reason": "检定机构撤回原证明，待重开"})
+    show("同号同理由重试（200 幂等）", s, r, "idempotent")
+    s, r = call("POST", f"/temperature-certificates/API-CERT-NOPE-{run_id}/void",
+                {"reason": "不存在的证明号"})
+    print("作废未知证明号:", s, r.get("error", {}).get("code"))
+    s, r = call("GET", f"/samples/{ccode}/temperature/trusted")
+    print("作废后可信复核: 可评估 =", r["evaluable"], "| 有证读数", r["trusted_reading_count"])
+    s, r = call("GET", f"/temperature-certificates/API-CERT-A-{run_id}")
+    print("作废证明查询留痕:", s, r["certificate"]["status"], "|", r["certificate"]["void_reason"])
+
 
 if __name__ == "__main__":
     main()
