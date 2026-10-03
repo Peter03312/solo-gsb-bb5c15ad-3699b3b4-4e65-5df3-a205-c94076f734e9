@@ -738,6 +738,88 @@ def main() -> None:
             who = a.get("custodian") or (f"在途 {a.get('transfer_no')}" if a["kind"] == "in_transit" else "待核")
             print(f"  重算后段 {seg['start']} → {seg['end']} 归属: {who}")
 
+    # 18) 测温设备校准证明 + 可信复核（证明可晚于读数补录，不改变原始读数/版本/案卷）
+    print("\n=== 测温设备校准证明与可信复核 ===")
+    cal_id = f"API-CAL-{run_id}"
+    s, r = call("POST", "/temperature-calibrations", {
+        "certificate_id": cal_id,
+        "device_id": "DEV-COLD-01",
+        "valid_from": "2026-09-30T01:00:00Z",
+        "valid_to": "2026-09-30T05:00:00Z",
+        "issued_by": "计量员甲",
+    })
+    show("补录设备校准证明（201；有效期左闭右开）", s, r, "certificate")
+
+    # 同号同内容重试（换时区表示，归一后仍相同）→ 200；改结束时间 → 409
+    s, r = call("POST", "/temperature-calibrations", {
+        "certificate_id": cal_id,
+        "device_id": "DEV-COLD-01",
+        "valid_from": "2026-09-30T03:00:00+02:00",
+        "valid_to": "2026-09-30T07:00:00+02:00",
+        "issued_by": "计量员甲",
+    })
+    show("同证明号同内容重试（200 返回原证明）", s, r, "idempotent")
+    s, r = call("POST", "/temperature-calibrations", {
+        "certificate_id": cal_id,
+        "device_id": "DEV-COLD-01",
+        "valid_from": "2026-09-30T01:00:00Z",
+        "valid_to": "2026-09-30T06:00:00Z",
+        "issued_by": "计量员甲",
+    })
+    print("同证明号异内容:", s, r.get("error", {}).get("code"))
+
+    # 设备必须已有读数；有效时段不得与同设备未作废证明重叠（相邻端点允许）
+    s, r = call("POST", "/temperature-calibrations", {
+        "certificate_id": f"API-CAL-UNKNOWN-{run_id}",
+        "device_id": "DEV-NOT-USED",
+        "valid_from": "2026-09-30T01:00:00Z",
+        "valid_to": "2026-09-30T05:00:00Z",
+        "issued_by": "计量员甲",
+    })
+    print("无读数设备登记证明:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", "/temperature-calibrations", {
+        "certificate_id": f"API-CAL-OVERLAP-{run_id}",
+        "device_id": "DEV-COLD-01",
+        "valid_from": "2026-09-30T03:00:00Z",
+        "valid_to": "2026-09-30T06:00:00Z",
+        "issued_by": "计量员乙",
+    })
+    print("有效证明时段重叠:", s, r.get("error", {}).get("code"),
+          "| 冲突证明:", r.get("error", {}).get("details", {}).get("overlapping_certificate_ids"))
+    s, r = call("GET", "/temperature-calibrations?device_id=DEV-COLD-01")
+    show("按设备查询证明（含状态）", s, r, "total")
+
+    # 可信复核：逐条给证明号/缺证原因；只用有证读数计算超温和相邻有证读数缺测
+    s, r = call("GET", f"/samples/{tcode}/temperature/trusted")
+    print(f"\n--- 可信测温复核 [HTTP {s}] ---")
+    print("评估状态:", r["assessment_status"], "| 有证读数:",
+          f"{r['certified_reading_count']}/{r['reading_count']}")
+    for m in r["reading_matches"]:
+        proof = m["certificate_id"] if m["certified"] else f"缺证:{m['missing_reason']['code']}"
+        print(f"  {m['occurred_at']} {m['reading_id']} {m['value_celsius']}℃ -> {proof}")
+    print("可信超温点:", [(x["reading_id"], x["certificate_id"]) for x in r["out_of_range_points"]])
+    print("可信缺测区间:", [(g["before_reading_id"], g["after_reading_id"]) for g in r["gap_intervals"]])
+
+    # 原 /temperature 查询仍按全部读数，不受证明影响
+    s, old = call("GET", f"/samples/{tcode}/temperature")
+    print("既有测温查询仍列全部读数:", old["reading_count"],
+          "| 原始超温点数:", len(old["out_of_range_points"]))
+
+    # 作废证明：同理由重试返回原结果，异理由冲突；查询即时变为无法评估
+    s, r = call("POST", f"/temperature-calibrations/{cal_id}/void",
+                {"reason": "示例：证明文件晚到但复核发现编号错误"})
+    show("作废校准证明（201，之后不再覆盖读数）", s, r, "certificate", "status")
+    s, r = call("POST", f"/temperature-calibrations/{cal_id}/void",
+                {"reason": "示例：证明文件晚到但复核发现编号错误"})
+    show("同证明同理由重试（200 幂等）", s, r, "idempotent")
+    s, r = call("POST", f"/temperature-calibrations/{cal_id}/void",
+                {"reason": "改成另一个作废理由"})
+    print("不同作废理由:", s, r.get("error", {}).get("code"))
+    s, r = call("GET", f"/samples/{tcode}/temperature/trusted")
+    print("作废后可信复核状态:", r["assessment_status"], "| 原因:", r["unable_to_assess_reason"])
+    for m in r["reading_matches"]:
+        print(f"  {m['reading_id']} 缺证原因: {m['missing_reason']['code']}")
+
 
 if __name__ == "__main__":
     main()

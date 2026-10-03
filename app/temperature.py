@@ -333,6 +333,45 @@ def _attribution_at(periods: list[dict[str, Any]], t: str) -> dict[str, Any]:
     return {"kind": "pending_review", "detail": "时刻早于样本采集时间，归属不能确定"}
 
 
+def _gap_intervals(
+    readings: list[sqlite3.Row],
+    max_interval: int,
+    split_events: list[sqlite3.Row],
+    periods: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """按相邻读数计算超间隔缺测区间，并沿用保管链区间拆分与归属。"""
+    split_times = sorted({
+        ev["occurred_at"] for ev in split_events if ev["event_type"] in ("transfer", "receive")
+    })
+    gaps: list[dict[str, Any]] = []
+    for prev, nxt in zip(readings, readings[1:]):
+        duration = _seconds_between(prev["occurred_at"], nxt["occurred_at"])
+        if duration <= max_interval:
+            continue
+        bounds = [prev["occurred_at"]]
+        bounds += [t for t in split_times if prev["occurred_at"] < t < nxt["occurred_at"]]
+        bounds.append(nxt["occurred_at"])
+        segments = [
+            {
+                "start": a,
+                "end": b,
+                "duration_seconds": _seconds_between(a, b),
+                "attribution": _attribution_at(periods, a),
+            }
+            for a, b in zip(bounds, bounds[1:])
+        ]
+        gaps.append({
+            "start": prev["occurred_at"],
+            "end": nxt["occurred_at"],
+            "duration_seconds": duration,
+            "max_interval_seconds": max_interval,
+            "before_reading_id": prev["reading_id"],
+            "after_reading_id": nxt["reading_id"],
+            "segments": segments,
+        })
+    return gaps
+
+
 # --------------------------------------------------------------------------- 测温证据复核查询
 
 def get_temperature_review(conn: sqlite3.Connection, sample_code: str) -> dict[str, Any]:
@@ -390,36 +429,7 @@ def get_temperature_review(conn: sqlite3.Connection, sample_code: str) -> dict[s
                 "attribution": _attribution_at(periods, r["occurred_at"]),
             })
 
-    # 缺测区间：相邻读数间隔超过最大测温间隔；跨当前有效链移交/签收时刻的段须拆分
-    split_times = sorted({
-        ev["occurred_at"] for ev in events if ev["event_type"] in ("transfer", "receive")
-    })
-    gaps: list[dict[str, Any]] = []
-    for prev, nxt in zip(readings, readings[1:]):
-        duration = _seconds_between(prev["occurred_at"], nxt["occurred_at"])
-        if duration <= max_interval:
-            continue
-        bounds = [prev["occurred_at"]]
-        bounds += [t for t in split_times if prev["occurred_at"] < t < nxt["occurred_at"]]
-        bounds.append(nxt["occurred_at"])
-        segments = [
-            {
-                "start": a,
-                "end": b,
-                "duration_seconds": _seconds_between(a, b),
-                "attribution": _attribution_at(periods, a),
-            }
-            for a, b in zip(bounds, bounds[1:])
-        ]
-        gaps.append({
-            "start": prev["occurred_at"],
-            "end": nxt["occurred_at"],
-            "duration_seconds": duration,
-            "max_interval_seconds": max_interval,
-            "before_reading_id": prev["reading_id"],
-            "after_reading_id": nxt["reading_id"],
-            "segments": segments,
-        })
+    gaps = _gap_intervals(readings, max_interval, events, periods)
 
     return {
         "sample_code": sample["sample_code"],

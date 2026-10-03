@@ -354,3 +354,37 @@ class TempReadingIn(BaseModel):
     device_id: str = Field(..., min_length=1, description="测温设备号")
     occurred_at: datetime = Field(..., description="读数发生时间 ISO8601（不得早于采集时间）")
     value_celsius: float = Field(..., allow_inf_nan=False, description="摄氏温度读数（有限数值）")
+
+
+class CalibrationIn(BaseModel):
+    """测温设备校准证明登记：证明号全局唯一，有效期采用左闭右开区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    certificate_id: str = Field(..., min_length=1, description="全局唯一校准证明号，同号重试幂等")
+    device_id: str = Field(..., min_length=1, description="测温设备号；须已有测温读数")
+    valid_from: datetime = Field(..., description="证明有效起始时刻（含，ISO8601）")
+    valid_to: datetime = Field(..., description="证明有效结束时刻（不含，ISO8601）")
+    issued_by: str = Field(..., min_length=1, description="证明签发人")
+
+    @model_validator(mode="after")
+    def _check_validity_period(self) -> "CalibrationIn":
+        if self.valid_to <= self.valid_from:
+            raise ValueError("校准证明有效期必须满足 valid_from < valid_to（左闭右开，空时段无效）")
+        if not self.issued_by.strip():
+            raise ValueError("校准证明签发人不得为空白")
+        return self
+
+
+class CalibrationVoidIn(BaseModel):
+    """按证明号附理由作废校准证明。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=1, description="作废原因")
+
+    @model_validator(mode="after")
+    def _check_reason(self) -> "CalibrationVoidIn":
+        if not self.reason.strip():
+            raise ValueError("作废原因不得为空白")
+        return self

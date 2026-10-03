@@ -10,6 +10,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import config
+from .calibrations import (
+    calibration_view,
+    get_certificate_or_404,
+    get_trusted_temperature_review,
+    list_calibrations,
+    register_calibration,
+    void_calibration,
+)
 from .db import db_session, init_db, row_to_dict
 from .dossiers import get_dossier, submit_dossier, verify_dossier
 from .identities import add_alias, get_person, list_persons, register_person
@@ -27,6 +35,8 @@ from .schemas import (
     SampleIn,
     TempConfigIn,
     TempReadingIn,
+    CalibrationIn,
+    CalibrationVoidIn,
     TransferBatchIn,
 )
 from .service import (
@@ -64,8 +74,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="样本交接链核验服务",
-    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避与运输测温证据复核",
-    version="1.8.0",
+    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避、运输测温证据复核与设备校准可信复核",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -358,6 +368,64 @@ def get_temperature_review_api(sample_code: str) -> dict[str, Any]:
     """
     with db_session() as conn:
         return get_temperature_review(conn, sample_code)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature/trusted", tags=["temperature"])
+def get_trusted_temperature_review_api(sample_code: str) -> dict[str, Any]:
+    """可信测温复核：逐条列出读数匹配的证明号或缺证原因。
+
+    仅使用被未作废证明按左闭右开有效期覆盖的读数计算超温点，以及相邻有证读数间的
+    缺测区间；保管链区间拆分与归属规则与既有测温复核完全一致。没有任何有证读数时
+    `assessment_status=unable_to_assess`，且评估结果为空。补录/作废证明后查询即时重算。
+    """
+    with db_session() as conn:
+        return get_trusted_temperature_review(conn, sample_code)
+
+
+# --------------------------------------------------------------------------- 测温设备校准证明
+
+@app.post(f"{API_PREFIX}/temperature-calibrations", tags=["temperature"], status_code=201)
+def register_calibration_api(data: CalibrationIn) -> JSONResponse:
+    """登记测温设备校准证明（全局唯一证明号、设备号、左闭右开有效期与签发人）。
+
+    * 设备号必须已出现在测温读数中；有效期 valid_from < valid_to；
+    * 同一设备未作废证明有效时段不得重叠（相邻端点允许，已作废证明不参与）；
+    * 同证明号同内容重试 → 200 返回原结果；异内容 → 409 calibration_conflict；
+    * 无效时段 → 422；重叠 → 409 calibration_overlap；失败不留部分记录。
+    """
+    with db_session(immediate=True) as conn:
+        certificate, idempotent = register_calibration(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"certificate": certificate, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/temperature-calibrations", tags=["temperature"])
+def list_calibrations_api(device_id: str | None = None) -> dict[str, Any]:
+    """列出校准证明；可用 ?device_id= 仅查看某台设备（含已作废证明）。"""
+    with db_session() as conn:
+        return list_calibrations(conn, device_id)
+
+
+@app.get(f"{API_PREFIX}/temperature-calibrations/{{certificate_id}}", tags=["temperature"])
+def get_calibration_api(certificate_id: str) -> dict[str, Any]:
+    """按证明号查询校准证明及作废状态；未知证明 → 404 calibration_not_found。"""
+    with db_session() as conn:
+        row = get_certificate_or_404(conn, certificate_id)
+        return {"certificate": calibration_view(row)}
+
+
+@app.post(f"{API_PREFIX}/temperature-calibrations/{{certificate_id}}/void", tags=["temperature"], status_code=201)
+def void_calibration_api(certificate_id: str, data: CalibrationVoidIn) -> JSONResponse:
+    """附理由作废校准证明。
+
+    * 作废后该证明不再覆盖任何读数，可信复核即时重算；
+    * 未知证明 → 404 calibration_not_found；
+    * 同证明号同理由重试 → 200 返回原作废结果；不同理由 → 409 calibration_void_conflict。
+    """
+    with db_session(immediate=True) as conn:
+        certificate, idempotent = void_calibration(conn, certificate_id, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"certificate": certificate, "idempotent": idempotent})
 
 
 # --------------------------------------------------------------------------- 案卷封存（同一抽检多份样本）
